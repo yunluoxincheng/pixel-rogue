@@ -2446,8 +2446,9 @@ ctx.stroke();      // → strokePath()
 ## D-86 真实伤害飘字颜色（v82）
 
 - 用户需求：真实伤害的数字需要与其他伤害区分，使用银亮的白色；首版颜色差异不明显，后续加强为银白字 + 冷蓝实心外圈，真实伤害暴击再叠金色外圈。
-- 改动：`core/CombatSystem.ts` 新增 `TRUE_DAMAGE_COLOR = "#eaf7ff"` 与 `TRUE_DAMAGE_OUTLINE = "#38bdf8"`；`hurtEnemy` 在 `opts.type === "true"` 或 `trueFraction` 结算出额外真实伤害时给 `FloatingText.trueDmg` 打标，优先级高于「强化箭/暴击」的金色。`rendering/draw.ts` 对真实伤害飘字使用 12px 冷蓝字号铺底形成实心外圈，再叠 10px 银白主体；真实伤害暴击（`trueDmg && big`）改用 16px 金色外圈 + 14px 冷蓝内圈 + 12px 纯白主体；普通飘字仍为 8px。因 `PixelPainter` 不暴露 canvas 阴影 API，采用大字号铺底而不是 shadowBlur。
-- 验证：`npm run typecheck`、`npm run build` 通过；受控调用 `hurtEnemy` 对比 true / physical+specialHit / physical+trueFraction 三种飘字的颜色与 `trueDmg` 标记。按 2026-10-29 标准未运行 Vitest / Playwright。
+- 改动：`core/CombatSystem.ts` 新增 `TRUE_DAMAGE_COLOR = "#eaf7ff"` 与 `TRUE_DAMAGE_OUTLINE = "#38bdf8"`；`hurtEnemy` 在 `opts.type === "true"` 或 `trueFraction` 结算出额外真实伤害时给 `FloatingText.trueDmg` 打标，优先级高于「强化箭/暴击」的金色。`rendering/draw.ts` 对普通真实伤害使用 12px 冷蓝外圈 + 10px 深色落影 + 10px 银白主体；真实伤害暴击使用 16px 金色外圈 + 14px 冷蓝内圈 + 12px 深色落影 + 12px 纯白主体。普通飘字仍为 8px。
+- 性能说明：初版真实伤害每个数字用 3–4 次 `fillText` 分层，后期强化弹满级、多目标穿透时叠加剧烈卡顿；中途曾临时改为单层描边，v84 固定槽位完成后恢复上述分层样式（层数不再带来每帧纹理重建）。
+- 验证：`npm run typecheck`、`npm run build` 通过；受控调用 `hurtEnemy` 对比 true / physical+specialHit / physical+trueFraction 三种飘字的颜色、`trueDmg` 标记与 label 层数。按 2026-10-29 标准未运行 Vitest / Playwright。
 
 ## D-87 冲刺强射替换反弹（v83）
 
@@ -2460,3 +2461,18 @@ ctx.stroke();      // → strokePath()
   5. `core/ProjectileSystem.ts` / `core/types.ts`：删除世界边界反弹分支与 `Bullet.bounces` 字段。
 - 验证：`npm run typecheck`、`npm run build` 通过；受控运行确认冲刺结束开启 0.8 秒窗口、窗口内射击均为特殊弹，且无 `bounce`/`bounces` 残留引用。按 2026-10-29 标准未运行 Vitest / Playwright。
 - E2E 沙盒：新增仅 DEV/E2E 生效的 `?test=dash-special`（只带「冲刺强射」，满级强化箭 + 10000 HP 精英），避免 `special-max` 的全升级干扰窗口手感测试。
+- 性能沙盒：新增 `?test=special-swarm`（满级强化箭 + 全部升级 + 80 只 5000 HP、0 伤害、0 经验的沙包，死亡自动补充），用于复现后期多目标真实伤害飘字压力；与 `?test=special-max`、`?test=dash-special` 一样仅在 DEV/E2E 生效。
+
+## D-88 飘字固定槽位性能优化（v84）
+
+- 用户反馈：后期强化弹满级后仍有轻微卡顿；要求不改变数字内容/样式，只优化渲染。
+- 根因定位：
+  1. 静态对照：160 个固定真实伤害 label 同时渲染，帧间隔约 4ms；
+  2. 动态高压（80 怪、161 条飘字、266 个 label、手动提高攻速/多重）：帧间隔约 150ms；
+  3. `PixelPainter.fillText` 按绘制顺序分配 label，飘字过期后后续文字整体前移，导致大部分 label 每帧 `setText`/颜色/字号变化，Phaser Text 重建 canvas 并上传纹理。贵的不是 label 数量，而是每帧重建。
+- 改动：
+  1. `rendering/PixelPainter.ts`：拆出 `TextLabelPool`；HUD 使用顺序池，浮动文字使用独立固定槽位池；公开 `fillTextSlot(slot, ...)`；`counts.text` 合计两个池。
+  2. `rendering/draw.ts`：用按 GameCore 隔离的 `WeakMap` 维护每条 `FloatingText` 的固定槽位组（普通 2 层、真实 3 层、真实暴击 4 层）；文字过期时回收槽位，新文字只在首次绘制时建纹理，之后只更新坐标/透明度/深度。
+  3. HUD 文字保持原顺序池与缓存逻辑，不受影响。
+- 验证：`npm run typecheck`、`npm run build` 通过；同一高压沙盒（80 怪、136 条飘字、497 label、34 弹，已恢复真实伤害分层样式）帧间隔约 **150ms → 5.4ms**（p95 8.5ms、max 16.7ms）；截图确认数字逐条显示、颜色/字号不变。按 2026-10-29 标准未运行 Vitest / Playwright。
+- 沙盒：`?test=special-swarm` 保留，满级强化箭 + 80 只 5000 HP 零伤害沙包；可继续用 `?test=special-max` / `?test=dash-special`。
